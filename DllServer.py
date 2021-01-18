@@ -59,11 +59,22 @@ def all_methods(obj):
             temp.append(name)
     return temp
 
-class ProxyClass(object):
+
+def dispatch(c, id, methodname, args=(), kwds={}):
+    '''
+    Send a message to manager using connection `c` and return response
+    '''
+    c.send((id, methodname, args, kwds))
+    kind, result = c.recv()
+    if kind == '#RETURN':
+        return result
+
+
+class BaseProxy(object):
     
-    def __init__(self, typeid, conn):
-        self.typeid = typeid
+    def __init__(self, conn, typeid, manager=None, exposed=None):
         self.conn = conn
+        self.typeid = typeid
 
     def _callmethod(self, methodname, args=(), kwds={}):
         self.conn.send((self.typeid, methodname, args, kwds))
@@ -79,36 +90,74 @@ class ProxyClass(object):
 def MakeProxyType(name, exposed):
     dic = {}
     for meth in exposed:
-        exec('''def %s(self, /, *args, **kwds):
-        return self._callmethod(%r, args, kwds)''' % (meth, meth), dic)
+        exec('''def %s(self, *args, **kwds):
+        return self''' % (meth), dic)
+        # exec('''def %s(self, *args, **kwds):
+        # return self._callmethod(%r, args, kwds)''' % (meth, meth), dic)
 
-    ProxyType = type(name, (ProxyClass,), dic)
+    ProxyType = type(name, (BaseProxy,), dic)
     ProxyType._exposed_ = exposed
     return ProxyType
+
+def PipeProxy(conn, typeid, server, exposed=None):
+
+    if exposed is None:
+        exposed = dispatch(conn, None, 'get_methods')
+    ProxyType = MakeProxyType('PipeProxy[%s]' % typeid, exposed)
+    proxy = ProxyType(conn, typeid, server, exposed)
+    return proxy
 
 def RebuildProxy(func, name, exposed):
     return func(name, exposed)
 
 def test_func():
+    print('test_func')
     return 'test_func'
 
+class TestClass(object):
+    def __init__(self):
+        print('TestClass')
+    def test1(self):
+        pass
+    pass
 class Server(object):
 
     _registry = {}
+    _public = ('_create', '_get_methods')
 
     def __init__(self):
         reader = io.open(sys.stdin.fileno(), mode='rb', closefd=False)
         writer = io.open(sys.stdout.fileno(), mode='wb', closefd=False)
         self.conn = Connection(reader, writer)
 
+    def public_request(self, funcname, args, kwds={}):
+        if funcname in self._public:
+            func = getattr(self, funcname)
+            result = func(self, *args, **kwds)
+            msg = ('#RETURN', result)
+            self.conn.send(msg)
+
     def serve_forever(self):
         try:
             while True:
-                args = self.conn.recv()
+                request = self.conn.recv()
+                typeid, funcname, args, kwds = request
+                if typeid == None:
+                    pass
+                elif typeid in self._registry:
+                    pass
+                else:
+                    pass
                 # print('server', args, file=sys.stderr)
                 # self.conn.send(args)
         except (KeyboardInterrupt, SystemExit, EOFError):
             print('process ended', file=sys.stderr)
+
+    def _get_conn(self):
+        return self.conn
+
+    def _create(self):
+        pass
 
     @classmethod
     def register(cls, typeid, caller=None, proxytype=None):
@@ -120,7 +169,8 @@ class Server(object):
         cls._registry[typeid] = (caller, exposed)
         
         def temp(self, *args, **kwds):
-            proxy = MakeProxyType(typeid, exposed)
+            conn = self._get_conn()
+            proxy = PipeProxy(conn, typeid, self, exposed)
             return proxy
         temp.__name__ = typeid
         setattr(cls, typeid, temp)
@@ -129,7 +179,7 @@ class TestServer(Server):
     pass
 
 
-TestServer.register('test_func', test_func)
+TestServer.register('TestClass', TestClass)
 
 def main():
     reader = io.open(sys.stdin.fileno(), mode='rb', closefd=False)
@@ -146,6 +196,11 @@ def main():
 
 if __name__ == "__main__":
     t = TestServer()
+    # a= 
+    print(dir(t.TestClass()))
+    print(dir(t.TestClass().test1()))
+    # t = PipeProxy(None, 'test', None, ('t1', 't2', 't3'))
+
     # print(dir(t))
     # print(dir(t.test_func()))
     # pass
