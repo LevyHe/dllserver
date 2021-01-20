@@ -4,13 +4,14 @@ import platform
 import pickle
 from argparse import ArgumentParser
 from multiprocessing.managers import BaseManager
-from multiprocessing import Manager, freeze_support
+from multiprocessing import Manager, freeze_support, Process
 import os,io
 import sys
 # from pyuds.Scripts import DllKeyGen, BaseKeyGen
 import time
 from threading import Thread
 import signal
+from subprocess import Popen, PIPE
 
 def pack_data(args):
     data = pickle.dumps(args)
@@ -51,6 +52,25 @@ class Connection(object):
         self.write_bytes(data)
 
 
+class Token(object):
+    '''
+    Type to uniquely identify a shared object
+    '''
+    __slots__ = ('typeid', 'conn', 'id')
+
+    def __init__(self, typeid, conn, id):
+        (self.typeid, self.conn, self.id) = (typeid, conn, id)
+
+    def __getstate__(self):
+        return (self.typeid, self.conn, self.id)
+
+    def __setstate__(self, state):
+        (self.typeid, self.conn, self.id) = state
+
+    def __repr__(self):
+        return '%s(typeid=%r, conn=%r, id=%r)' % \
+               (self.__class__.__name__, self.typeid, self.conn, self.id)
+
 def all_methods(obj):
     temp = []
     for name in dir(obj):
@@ -69,42 +89,41 @@ def dispatch(c, id, methodname, args=(), kwds={}):
     if kind == '#RETURN':
         return result
 
+def err_print(*args,**kwargs):
+    print(*args, **kwargs, file=sys.stderr)
 
 class BaseProxy(object):
     
-    def __init__(self, conn, typeid, manager=None, exposed=None):
-        self.conn = conn
-        self.typeid = typeid
+    def __init__(self, token, manager=None, exposed=None):
+        self._conn = token.conn
+        self._typeid = token.typeid
+        self._id = token.id
 
     def _callmethod(self, methodname, args=(), kwds={}):
-        self.conn.send((self.typeid, methodname, args, kwds))
-        kind, result = self.conn.recv()
+        self._conn.send((self._id, methodname, args, kwds))
+        kind, result = self._conn.recv()
         if kind == '#RETURN':
             return result
         elif kind == '#PROXY':
             pass
 
     def __reduce__(self):
-        return (RebuildProxy, (MakeProxyType, self.typeid, self._exposed_))
+        return (RebuildProxy, (MakeProxyType, self._typeid, self._exposed_))
 
 def MakeProxyType(name, exposed):
     dic = {}
     for meth in exposed:
         exec('''def %s(self, *args, **kwds):
-        return self''' % (meth), dic)
-        # exec('''def %s(self, *args, **kwds):
-        # return self._callmethod(%r, args, kwds)''' % (meth, meth), dic)
+        return self._callmethod(%r, args, kwds)''' % (meth, meth), dic)
 
     ProxyType = type(name, (BaseProxy,), dic)
     ProxyType._exposed_ = exposed
     return ProxyType
 
-def PipeProxy(conn, typeid, server, exposed=None):
 
-    if exposed is None:
-        exposed = dispatch(conn, None, 'get_methods')
-    ProxyType = MakeProxyType('PipeProxy[%s]' % typeid, exposed)
-    proxy = ProxyType(conn, typeid, server, exposed)
+def PipeProxy(token, server, exposed=None):
+    ProxyType = MakeProxyType('PipeProxy[%s]' % token.typeid, exposed)
+    proxy = ProxyType(token, server, exposed)
     return proxy
 
 def RebuildProxy(func, name, exposed):
@@ -118,46 +137,57 @@ class TestClass(object):
     def __init__(self):
         print('TestClass')
     def test1(self):
-        pass
-    pass
+        return 'test1'
+
 class Server(object):
 
     _registry = {}
     _public = ('_create', '_get_methods')
 
-    def __init__(self):
-        reader = io.open(sys.stdin.fileno(), mode='rb', closefd=False)
-        writer = io.open(sys.stdout.fileno(), mode='wb', closefd=False)
+    def __init__(self, reader, writer):
         self.conn = Connection(reader, writer)
+        self.obj_list = {}
 
-    def public_request(self, funcname, args, kwds={}):
+    def public_request(self, funcname, typeid, args, kwds={}):
         if funcname in self._public:
             func = getattr(self, funcname)
-            result = func(self, *args, **kwds)
+            result = func(typeid, *args, **kwds)
             msg = ('#RETURN', result)
             self.conn.send(msg)
+
+    def call_handler(self, ident, funcname, args, kwds={}):
+        obj, exposed = self.obj_list[ident]
+        func = getattr(obj, funcname)
+        result = func(*args, **kwds)
+        msg = ('#RETURN', result)
+        self.conn.send(msg)
 
     def serve_forever(self):
         try:
             while True:
                 request = self.conn.recv()
-                typeid, funcname, args, kwds = request
-                if typeid == None:
-                    pass
-                elif typeid in self._registry:
-                    pass
+                ident, funcname, args, kwds = request
+                if ident == None:
+                    typeid = args[0]
+                    self.public_request(funcname, typeid, args[1:], kwds)
+                elif ident in self.obj_list:
+                    self.call_handler(ident, funcname, args, kwds)
                 else:
                     pass
                 # print('server', args, file=sys.stderr)
                 # self.conn.send(args)
-        except (KeyboardInterrupt, SystemExit, EOFError):
+        except (KeyboardInterrupt, SystemExit, EOFError, OSError):
             print('process ended', file=sys.stderr)
 
     def _get_conn(self):
         return self.conn
 
-    def _create(self):
-        pass
+    def _create(self, typeid, *args, **kwds):
+        caller, exposed = self._registry[typeid]
+        obj = caller(*args, **kwds)
+        ident = '%x' % id(obj)
+        self.obj_list[ident] = (obj, exposed)
+        return ident, tuple(exposed)
 
     @classmethod
     def register(cls, typeid, caller=None, proxytype=None):
@@ -170,7 +200,9 @@ class Server(object):
         
         def temp(self, *args, **kwds):
             conn = self._get_conn()
-            proxy = PipeProxy(conn, typeid, self, exposed)
+            ident,  exposed = dispatch(conn, None, '_create', (typeid,)+args, kwds)
+            token = Token(typeid, conn, ident)
+            proxy = PipeProxy(token, self, exposed)
             return proxy
         temp.__name__ = typeid
         setattr(cls, typeid, temp)
@@ -181,24 +213,44 @@ class TestServer(Server):
 
 TestServer.register('TestClass', TestClass)
 
-def main():
+# def main():
+#     reader = io.open(sys.stdin.fileno(), mode='rb', closefd=False)
+#     writer = io.open(sys.stdout.fileno(), mode='wb', closefd=False)
+#     con = Connection(reader, writer)
+#     try:
+#         while True:
+#             args = con.recv()
+#             print('server',args, file=sys.stderr)
+#             con.send(args)
+#     except (KeyboardInterrupt, SystemExit, EOFError):
+#         print('process ended', file=sys.stderr)
+
+def ServerStart():
     reader = io.open(sys.stdin.fileno(), mode='rb', closefd=False)
     writer = io.open(sys.stdout.fileno(), mode='wb', closefd=False)
-    con = Connection(reader, writer)
-    try:
-        while True:
-            args = con.recv()
-            print('server',args, file=sys.stderr)
-            con.send(args)
-    except (KeyboardInterrupt, SystemExit, EOFError):
-        print('process ended', file=sys.stderr)
+    t = TestServer(reader, writer)
+    t.serve_forever()
+
 
 
 if __name__ == "__main__":
-    t = TestServer()
-    # a= 
-    print(dir(t.TestClass()))
-    print(dir(t.TestClass().test1()))
+    if len(sys.argv) > 1:
+        err_print('start',os.getpid())
+        ServerStart()
+        err_print(os.getpid())
+    else:
+        cmd = ['python', 'DllServer.py', 'server']
+        _proc = Popen(cmd, shell=False, stderr=sys.stderr,
+                           stdout=PIPE, stdin=PIPE, bufsize=16, universal_newlines=False)
+        t = TestServer(_proc.stdout, _proc.stdin)
+        test = t.TestClass()
+        print(test.test1())
+        print(test.test1())
+        _proc.stdout.close()
+        _proc.stdin.close()
+        _proc.kill()
+        print(_proc.pid, os.getpid())
+        
     # t = PipeProxy(None, 'test', None, ('t1', 't2', 't3'))
 
     # print(dir(t))
