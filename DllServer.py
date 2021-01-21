@@ -1,19 +1,58 @@
 
-import json
 import platform
 import pickle
-from argparse import ArgumentParser
-from multiprocessing.managers import BaseManager
-from multiprocessing import Manager, freeze_support, Process
-import os,io
-import sys
-# from pyuds.Scripts import DllKeyGen, BaseKeyGen
-import time
-from threading import Thread
-import signal
+import sys,os,io
 from subprocess import Popen, PIPE
+from traceback import format_exc
+
+class RemoteError(Exception):
+    def __str__(self):
+        return ('\n' + '-'*75 + '\n' + str(self.args[0]) + '-'*75)
+
+def all_methods(obj):
+    temp = []
+    for name in dir(obj):
+        func = getattr(obj, name)
+        if callable(func) and name[0] != '_':
+            temp.append(name)
+    return temp
+
+
+def convert_to_error(kind, result):
+    if kind == '#ERROR':
+        raise ValueError(result)
+    elif kind in ('#TRACEBACK', '#UNSERIALIZABLE'):
+        if not isinstance(result, str):
+            raise TypeError(
+                "Result {0!r} (kind '{1}') type is {2}, not str".format(
+                    result, kind, type(result)))
+        if kind == '#UNSERIALIZABLE':
+            raise RemoteError('Unserializable message: %s\n' % result)
+        else:
+            raise RemoteError(result)
+    else:
+        raise ValueError('Unrecognized message type {!r}'.format(kind))
+
+def dispatch(c, id, methodname, args=(), kwds={}):
+    '''
+    Send a message to manager using connection `c` and return response
+    '''
+    c.send((id, methodname, args, kwds))
+    kind, result = c.recv()
+    if kind == '#RETURN':
+        return result
+    convert_to_error(kind, result)
+
+
+def err_print(*values, sep=' ', end='\n', flush=True):
+    '''print the message to stderr'''
+    msg = sep.join([str(v) for v in values])
+    sys.stderr.write(msg + end)
+    if flush:
+        sys.stderr.flush()
 
 def pack_data(args):
+    '''pack the args to pickle bytes'''
     data = pickle.dumps(args)
     num = len(data)
     num_b = num.to_bytes(4,'little')
@@ -22,10 +61,15 @@ def pack_data(args):
     return num_b + data + res
 
 def unpack_data(data):
+    '''unpack the pickle bytes to args'''
     args = pickle.loads(data)
     return args
 
 class Connection(object):
+    '''
+    reader: a BufferedReader, raw binary stream. example pipe
+    writer: a BufferedWriter, raw binary stream. example pipe
+    '''
     def __init__(self, reader, writer):
         self.reader = reader
         self.writer = writer
@@ -44,7 +88,9 @@ class Connection(object):
 
     def recv(self):
         data = self.read_bytes()
-        return unpack_data(data)
+        if data:
+            return unpack_data(data)
+        return None
 
     def send(self, args):
         data = pack_data(args)
@@ -71,26 +117,6 @@ class Token(object):
         return '%s(typeid=%r, conn=%r, id=%r)' % \
                (self.__class__.__name__, self.typeid, self.conn, self.id)
 
-def all_methods(obj):
-    temp = []
-    for name in dir(obj):
-        func = getattr(obj, name)
-        if callable(func) and name[0] != '_':
-            temp.append(name)
-    return temp
-
-
-def dispatch(c, id, methodname, args=(), kwds={}):
-    '''
-    Send a message to manager using connection `c` and return response
-    '''
-    c.send((id, methodname, args, kwds))
-    kind, result = c.recv()
-    if kind == '#RETURN':
-        return result
-
-def err_print(*args,**kwargs):
-    print(*args, **kwargs, file=sys.stderr)
 
 class BaseProxy(object):
     
@@ -98,17 +124,18 @@ class BaseProxy(object):
         self._conn = token.conn
         self._typeid = token.typeid
         self._id = token.id
+        self._token = token
+        self._manager = manager
 
     def _callmethod(self, methodname, args=(), kwds={}):
         self._conn.send((self._id, methodname, args, kwds))
         kind, result = self._conn.recv()
         if kind == '#RETURN':
             return result
-        elif kind == '#PROXY':
-            pass
+        convert_to_error(kind, result)
 
     def __reduce__(self):
-        return (RebuildProxy, (MakeProxyType, self._typeid, self._exposed_))
+        return (RebuildProxy, (PipeProxy, self._token, self._manager, self._exposed_))
 
 def MakeProxyType(name, exposed):
     dic = {}
@@ -126,20 +153,12 @@ def PipeProxy(token, server, exposed=None):
     proxy = ProxyType(token, server, exposed)
     return proxy
 
-def RebuildProxy(func, name, exposed):
-    return func(name, exposed)
 
-def test_func():
-    print('test_func')
-    return 'test_func'
+def RebuildProxy(func, token, server, exposed):
+    return func(token, server, exposed)
 
-class TestClass(object):
-    def __init__(self):
-        print('TestClass')
-    def test1(self):
-        return 'test1'
 
-class Server(object):
+class ProxyManger(object):
 
     _registry = {}
     _public = ('_create', '_get_methods')
@@ -149,23 +168,49 @@ class Server(object):
         self.obj_list = {}
 
     def public_request(self, funcname, typeid, args, kwds={}):
-        if funcname in self._public:
-            func = getattr(self, funcname)
-            result = func(typeid, *args, **kwds)
-            msg = ('#RETURN', result)
-            self.conn.send(msg)
+        try:
+            if funcname in self._public:
+                func = getattr(self, funcname)
+                result = func(typeid, *args, **kwds)
+                msg = ('#RETURN', result)
+            else:
+                msg = ('#ERROR', 'request is not a public methodname')
+        except Exception:
+            msg = ('#TRACEBACK', format_exc())
+        finally:
+            try:
+                self.conn.send(msg)
+            except Exception:
+                err_print("#REMOTE", format_exc())
+
 
     def call_handler(self, ident, funcname, args, kwds={}):
-        obj, exposed = self.obj_list[ident]
-        func = getattr(obj, funcname)
-        result = func(*args, **kwds)
-        msg = ('#RETURN', result)
-        self.conn.send(msg)
+        try:
+            obj, exposed = self.obj_list[ident]
+            func = getattr(obj, funcname)
+            result = func(*args, **kwds)
+            msg = ('#RETURN', result)
+        except:
+            msg = ('#TRACEBACK', format_exc())
+        finally:
+            try:
+                self.conn.send(msg)
+            except Exception:
+                err_print("#REMOTE",format_exc())
+
+    def error_handler(self, funcname):
+        msg = ('#UNSERIALIZABLE', funcname)
+        try:
+            self.conn.send(msg)
+        except Exception:
+            err_print("#REMOTE",format_exc())
 
     def serve_forever(self):
         try:
             while True:
                 request = self.conn.recv()
+                if request is None:
+                    continue
                 ident, funcname, args, kwds = request
                 if ident == None:
                     typeid = args[0]
@@ -173,11 +218,11 @@ class Server(object):
                 elif ident in self.obj_list:
                     self.call_handler(ident, funcname, args, kwds)
                 else:
-                    pass
-                # print('server', args, file=sys.stderr)
-                # self.conn.send(args)
+                    self.error_handler(funcname)
         except (KeyboardInterrupt, SystemExit, EOFError, OSError):
-            print('process ended', file=sys.stderr)
+            pass
+        except Exception:
+            err_print(format_exc())
 
     def _get_conn(self):
         return self.conn
@@ -207,34 +252,26 @@ class Server(object):
         temp.__name__ = typeid
         setattr(cls, typeid, temp)
 
-class TestServer(Server):
-    pass
-
-
-TestServer.register('TestClass', TestClass)
-
-# def main():
-#     reader = io.open(sys.stdin.fileno(), mode='rb', closefd=False)
-#     writer = io.open(sys.stdout.fileno(), mode='wb', closefd=False)
-#     con = Connection(reader, writer)
-#     try:
-#         while True:
-#             args = con.recv()
-#             print('server',args, file=sys.stderr)
-#             con.send(args)
-#     except (KeyboardInterrupt, SystemExit, EOFError):
-#         print('process ended', file=sys.stderr)
-
-def ServerStart():
-    reader = io.open(sys.stdin.fileno(), mode='rb', closefd=False)
-    writer = io.open(sys.stdout.fileno(), mode='wb', closefd=False)
-    t = TestServer(reader, writer)
-    t.serve_forever()
-
-
-
 if __name__ == "__main__":
+    class TestServer(ProxyManger):
+        pass
+    class TestClass(object):
+        def __init__(self):
+            print('TestClass')
+
+        def test1(self):
+            return 'test1'
+
+    TestServer.register('TestClass', TestClass)
+
+    def ServerStart():
+        reader = io.open(sys.stdin.fileno(), mode='rb', closefd=False)
+        writer = io.open(sys.stdout.fileno(), mode='wb', closefd=False)
+        t = TestServer(reader, writer)
+        t.serve_forever()
+
     if len(sys.argv) > 1:
+        print = err_print
         err_print('start',os.getpid())
         ServerStart()
         err_print(os.getpid())
@@ -243,29 +280,15 @@ if __name__ == "__main__":
         _proc = Popen(cmd, shell=False, stderr=sys.stderr,
                            stdout=PIPE, stdin=PIPE, bufsize=16, universal_newlines=False)
         t = TestServer(_proc.stdout, _proc.stdin)
-        test = t.TestClass()
-        print(test.test1())
-        print(test.test1())
-        _proc.stdout.close()
-        _proc.stdin.close()
-        _proc.kill()
-        print(_proc.pid, os.getpid())
-        
-    # t = PipeProxy(None, 'test', None, ('t1', 't2', 't3'))
+        try:
+            test = t.TestClass()
+            print(test.test1(a=1))
+        except:
+            print(format_exc())
+        finally:
+            pass
+            _proc.stdout.close()
+            _proc.stdin.close()
+            _proc.kill()
 
-    # print(dir(t))
-    # print(dir(t.test_func()))
-    # pass
-    # print(Test().__reduce__())
-    # t = MakeProxyType('test',('t1','t2','t3'))
-    # print(dir(t))
-    # print(dir(t(1,2)))
-    # print(callable(Server))
-    # print(type('proxy[11]', (Server,), {}))
-    # main()
-    # data = pack_data(1)
-    # print(len(data))
-    # print(data)
-    # freeze_support()
-    # main()
-    # os.kill(os.getpid(), signal.SIGINT)
+        
