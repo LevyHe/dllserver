@@ -1,4 +1,13 @@
 
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+Created on Fri Jan 22 22:25:22 2021
+
+@author: levy.he
+@file  : ProxyManager.py
+"""
+
 import platform
 import pickle
 import sys,os,io
@@ -7,7 +16,7 @@ from traceback import format_exc
 
 class RemoteError(Exception):
     def __str__(self):
-        return ('\n' + '-'*75 + '\n' + str(self.args[0]) + '-'*75)
+        return ('\n' + '-'*75 + '\n' + str(self.args[0]) + '\n' + '-'*75)
 
 def all_methods(obj):
     temp = []
@@ -27,7 +36,7 @@ def convert_to_error(kind, result):
                 "Result {0!r} (kind '{1}') type is {2}, not str".format(
                     result, kind, type(result)))
         if kind == '#UNSERIALIZABLE':
-            raise RemoteError('Unserializable message: %s\n' % result)
+            raise RemoteError('Unserializable message: %s' % result)
         else:
             raise RemoteError(result)
     else:
@@ -158,7 +167,7 @@ def RebuildProxy(func, token, server, exposed):
     return func(token, server, exposed)
 
 
-class ProxyManger(object):
+class ProxyManager(object):
 
     _registry = {}
     _public = ('_create', '_get_methods')
@@ -252,8 +261,28 @@ class ProxyManger(object):
         temp.__name__ = typeid
         setattr(cls, typeid, temp)
 
+def ServerForever(ServerType):
+    reader = io.open(sys.stdin.fileno(), mode='rb', closefd=False)
+    writer = io.open(sys.stdout.fileno(), mode='wb', closefd=False)
+    t = ServerType(reader, writer)
+    writer.write(b'start')
+    writer.flush()
+    t.serve_forever()
+
+
+def ServerClient(cmd, ServerType):
+    proc = Popen(cmd, shell=True, stderr=sys.stderr,
+                  stdout=PIPE, stdin=PIPE, bufsize=16, universal_newlines=False)
+    status = proc.stdout.read(5)
+    if status != b'start':
+        proc.kill()
+        raise RemoteError('Remote server can not start')
+    obj = ServerType(proc.stdout, proc.stdin)
+
+    return proc, obj
+
 if __name__ == "__main__":
-    class TestServer(ProxyManger):
+    class TestServer(ProxyManager):
         pass
     class TestClass(object):
         def __init__(self):
@@ -264,25 +293,17 @@ if __name__ == "__main__":
 
     TestServer.register('TestClass', TestClass)
 
-    def ServerStart():
-        reader = io.open(sys.stdin.fileno(), mode='rb', closefd=False)
-        writer = io.open(sys.stdout.fileno(), mode='wb', closefd=False)
-        t = TestServer(reader, writer)
-        t.serve_forever()
-
     if len(sys.argv) > 1:
         print = err_print
         err_print('start',os.getpid())
-        ServerStart()
+        ServerForever(TestServer)
         err_print(os.getpid())
     else:
-        cmd = ['python', 'DllServer.py', 'server']
-        _proc = Popen(cmd, shell=False, stderr=sys.stderr,
-                           stdout=PIPE, stdin=PIPE, bufsize=16, universal_newlines=False)
-        t = TestServer(_proc.stdout, _proc.stdin)
+        cmd = ['python', 'ProxyManager.py', 'server']
+        _proc, t = ServerClient(cmd, TestServer)
         try:
             test = t.TestClass()
-            print(test.test1(a=1))
+            print(test.test1())
         except:
             print(format_exc())
         finally:

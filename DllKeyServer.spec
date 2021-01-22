@@ -3,9 +3,9 @@ import platform
 name_ext= platform.architecture()[0]
 
 block_cipher = None
-exe_name = 'DllServer_' + name_ext
+exe_name = 'DllKeyServer_' + name_ext
 
-a = Analysis(['DllServer.py'],
+a = Analysis(['DllKeyServer.py'],
              pathex=['D:\\Project\\git\\dllserver'],
              binaries=[],
              datas=[],
