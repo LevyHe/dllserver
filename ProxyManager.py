@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
@@ -8,7 +7,6 @@ Created on Fri Jan 22 22:25:22 2021
 @file  : ProxyManager.py
 """
 
-import platform
 import pickle
 import sys,os,io
 from subprocess import Popen, PIPE
@@ -271,7 +269,7 @@ def ServerForever(ServerType):
 
 
 def ServerClient(cmd, ServerType):
-    proc = Popen(cmd, shell=True, stderr=sys.stderr,
+    proc = Popen(cmd, shell=False, stderr=sys.stderr,
                   stdout=PIPE, stdin=PIPE, bufsize=16, universal_newlines=False)
     status = proc.stdout.read(5)
     if status != b'start':
